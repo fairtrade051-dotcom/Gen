@@ -1,91 +1,119 @@
 import gradio as gr
-import zipfile
+import google.generativeai as genai
+import torch
+from diffusers import DiffusionPipeline
 import os
-import tempfile
 from PIL import Image
-import uuid
 
-# --- ฟังก์ชันจำลองการเจนรูป (ต้องเอาโค้ดโหลด Model จริงมาใส่ตรงนี้) ---
-def generate_single_image(prompt, model_name, ratio):
-    # กำหนดขนาดภาพตาม Ratio
-    width, height = 1024, 1024 # ค่าเริ่มต้น 1:1
-    if ratio == "16:9": width, height = 1280, 720
-    elif ratio == "9:16": width, height = 720, 1280
-    elif ratio == "4:3": width, height = 1024, 768
-    
-    # [ใส่โค้ด Inference ของ Flux, Qwen, หรือ Zimage ตรงนี้]
-    # ตัวอย่าง: สร้างภาพสีเทาเปล่าๆ เป็น Placeholder
-    dummy_img = Image.new('RGB', (width, height), color=(150, 150, 150))
-    return dummy_img
+# --- คอนฟิกโมเดล (ตัวอย่างการโหลด Flux แบบเบา) ---
+# หมายเหตุ: ใน RunPod ต้องเช่า GPU ที่ VRAM 24GB+ นะครับ
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- ฟังก์ชันหลักที่ทำงานเมื่อกดปุ่ม Generate ---
-def process_generation(text_prompt, txt_file, model_choice, num_per_prompt, ratio_choice):
-    prompts = []
+def load_model(model_name):
+    # ฟังก์ชันจำลองการเลือกโมเดล (ในอนาคตคุณสามารถเพิ่มเงื่อนไขโหลดจริงได้ที่นี่)
+    # ตัวอย่าง: if model_name == "Flux.1": pipe = DiffusionPipeline.from_pretrained(...)
+    return f"โหลดโมเดล {model_name} เรียบร้อยแล้ว (Simulated)"
+
+# --- ฟังก์ชัน Auto Prompt ด้วย Gemini ---
+def generate_auto_prompt(api_key, topic):
+    if not api_key:
+        return "กรุณาใส่ Gemini API Key ก่อนครับ"
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash') # ใช้ตัว Flash เพราะเร็วและถูก
+        instruction = f"Create a highly detailed, high-quality AI image generation prompt for the topic: '{topic}'. Keep it in English and focus on lighting, texture, and composition."
+        response = model.generate_content(instruction)
+        return response.text
+    except Exception as e:
+        return f"เกิดข้อผิดพลาดกับ API: {str(e)}"
+
+# --- ฟังก์ชันการเจนภาพ (Core Logic) ---
+def run_gen(model_name, ratio, txt_file, manual_prompt, auto_prompt, api_key):
+    # 1. รวบรวม Prompt
+    final_prompts = []
     
-    # 1. ดึงข้อความจาก Textbox
-    if text_prompt.strip():
-        prompts.append(text_prompt.strip())
-        
-    # 2. ดึงข้อความจากไฟล์ .txt (ถ้ามีอัปโหลดมา)
+    # ลำดับความสำคัญ: ไฟล์ .txt > Manual Prompt > Auto Prompt
     if txt_file is not None:
-        with open(txt_file, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-            prompts.extend([line.strip() for line in lines if line.strip()])
-            
-    if not prompts:
-        return None, "กรุณาใส่ Prompt หรืออัปโหลดไฟล์ .txt"
-
-    # สร้างโฟลเดอร์ชั่วคราวสำหรับเก็บรูปและไฟล์ Zip
-    temp_dir = tempfile.mkdtemp()
-    zip_filename = os.path.join(temp_dir, f"generated_images_{uuid.uuid4().hex[:6]}.zip")
+        with open(txt_file.name, 'r', encoding='utf-8') as f:
+            final_prompts = [line.strip() for line in f.readlines() if line.strip()]
+    elif manual_prompt.strip():
+        final_prompts = [manual_prompt]
+    elif auto_prompt.strip():
+        final_prompts = [auto_prompt]
     
-    generated_images = []
+    if not final_prompts:
+        return "ไม่มี Prompt ให้ทำงานครับ", None
+
+    # 2. จัดการ Aspect Ratio
+    ratios = {
+        "1:1": (1024, 1024),
+        "16:9": (1344, 768),
+        "9:16": (768, 1344),
+        "4:5": (896, 1152)
+    }
+    width, height = ratios.get(ratio, (1024, 1024))
+
+    # 3. เริ่มการเจน (Simulation) 
+    # ในการใช้งานจริงคุณต้องเอาโค้ด Pipe มาใส่ตรงนี้
+    output_images = []
+    status_msg = f"กำลังประมวลผล {len(final_prompts)} ภาพ ด้วยโมเดล {model_name}..."
     
-    # 3. เริ่มลูปเจนรูปตาม Prompt และจำนวนที่ตั้งไว้
-    with zipfile.ZipFile(zip_filename, 'w') as zipf:
-        for i, prompt in enumerate(prompts):
-            for j in range(num_per_prompt):
-                img = generate_single_image(prompt, model_choice, ratio_choice)
-                
-                # เซฟรูปชั่วคราว
-                img_name = f"prompt_{i+1}_img_{j+1}.png"
-                img_path = os.path.join(temp_dir, img_name)
-                img.save(img_path)
-                
-                # เอาลง Zip และเก็บไว้แสดงผลบน UI
-                zipf.write(img_path, arcname=img_name)
-                generated_images.append(img_path)
+    # สร้างโฟลเดอร์เก็บผลลัพธ์
+    os.makedirs("outputs", exist_ok=True)
+    
+    # นี่คือตัวอย่าง Loop การทำงาน
+    for i, p in enumerate(final_prompts):
+        print(f"Generating {i+1}/{len(final_prompts)}: {p}")
+        # สมมติว่านี่คือการเจนภาพจริง (Dummy Image)
+        dummy_img = Image.new('RGB', (width, height), color = (73, 109, 137))
+        img_path = f"outputs/img_{i}.png"
+        dummy_img.save(img_path)
+        output_images.append(img_path)
 
-    return generated_images, zip_filename
+    return f"เสร็จสิ้น! เจนทั้งหมด {len(output_images)} ภาพ", output_images
 
-# --- สร้าง Gradio UI ---
-with gr.Blocks(title="AutoGen Image Studio") as app:
-    gr.Markdown("## 🎨 AutoGen Image Studio (RunPod Template)")
+# --- หน้าตา UI (Gradio Layout) ---
+with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# 🚀 Sian Tui AI Web Gen v.1")
+    gr.Markdown("สร้างภาพแบบ Batch พร้อมระบบ Auto Prompt โดยใช้ Gemini")
     
     with gr.Row():
-        with gr.Column():
-            text_prompt = gr.Textbox(label="ใส่ Prompt ตรงนี้", placeholder="A cute cat cyberpunk style...", lines=3)
-            txt_file = gr.File(label="หรืออัปโหลดไฟล์ .txt (1 บรรทัด = 1 Prompt)", file_types=[".txt"])
+        # ฝั่งซ้าย: ตั้งค่าและ Input
+        with gr.Column(scale=1):
+            with gr.Group():
+                gr.Markdown("### 🔑 API Config")
+                api_key = gr.Textbox(label="Gemini API Key", placeholder="Paste your key here", type="password")
+                topic = gr.Textbox(label="หัวข้อภาพ (Topic)", placeholder="เช่น: ผู้หญิงไทยในชุดไซเบอร์พังก์")
+                gen_prompt_btn = gr.Button("🪄 ปั่น Prompt ออโต้", variant="secondary")
             
-            with gr.Row():
-                model_choice = gr.Dropdown(choices=["Flux", "Qwen", "Zimage"], value="Flux", label="เลือก Model")
-                ratio_choice = gr.Radio(choices=["1:1", "16:9", "9:16", "4:3"], value="1:1", label="Aspect Ratio")
-            
-            num_per_prompt = gr.Slider(minimum=1, maximum=10, step=1, value=1, label="จำนวนรูปต่อ 1 Prompt")
-            
-            generate_btn = gr.Button("🚀 Generate Images", variant="primary")
-            
-        with gr.Column():
-            gallery_out = gr.Gallery(label="Images Output", columns=2)
-            zip_out = gr.File(label="ดาวน์โหลดไฟล์ .zip ที่นี่")
-            status_out = gr.Textbox(label="Status", interactive=False)
+            with gr.Group():
+                gr.Markdown("### ⚙️ Generation Settings")
+                model_choice = gr.Dropdown(["Flux.1-dev", "Wan-2.1", "Z-image", "Qwen-VL-Gen"], label="เลือกโมเดล", value="Flux.1-dev")
+                ratio_choice = gr.Radio(["1:1", "16:9", "9:16", "4:5"], label="Aspect Ratio", value="1:1")
+                file_input = gr.File(label="อัปโหลดไฟล์ .txt (หนึ่งบรรทัดต่อหนึ่งภาพ)", file_types=[".txt"])
 
-    generate_btn.click(
-        fn=process_generation,
-        inputs=[text_prompt, txt_file, model_choice, num_per_prompt, ratio_choice],
-        outputs=[gallery_out, zip_out]
+        # ฝั่งขวา: ผลลัพธ์และการควบคุม
+        with gr.Column(scale=1):
+            prompt_display = gr.TextArea(label="Prompt ที่จะใช้รัน", lines=5)
+            manual_input = gr.Textbox(label="หรือพิมพ์ Prompt เอง (ถ้าไม่ได้อัปโหลดไฟล์)")
+            
+            run_btn = gr.Button("🔥 START GENERATION", variant="primary")
+            status_output = gr.Text(label="สถานะ")
+            gallery_output = gr.Gallery(label="ผลลัพธ์ภาพ", columns=2, height="auto")
+
+    # --- ระบบเชื่อมต่อปุ่ม (Events) ---
+    gen_prompt_btn.click(
+        generate_auto_prompt, 
+        inputs=[api_key, topic], 
+        outputs=prompt_display
+    )
+    
+    run_btn.click(
+        run_gen,
+        inputs=[model_choice, ratio_choice, file_input, manual_input, prompt_display, api_key],
+        outputs=[status_output, gallery_output]
     )
 
 if __name__ == "__main__":
-    # รันบน 0.0.0.0 เพื่อให้ RunPod ทำ Port Forwarding ได้ (ปกติใช้ Port 7860 หรือ 8000)
-    app.launch(server_name="0.0.0.0", server_port=7860)
+    # เปิด Share=True เพื่อให้ได้ลิงก์ .gradio.live ไว้รันนอก RunPod ได้
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=True)
