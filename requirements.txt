@@ -1,6 +1,8 @@
-gradio==4.44.1
-Pillow==10.4.0
-torch
+gradio
+google-generativeai
 diffusers
 transformers
 accelerate
+torch
+torchvision
+pillow
